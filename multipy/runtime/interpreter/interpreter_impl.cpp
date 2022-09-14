@@ -12,6 +12,7 @@
 #include <multipy/runtime/interpreter/builtin_registry.h>
 #include <multipy/runtime/interpreter/import_find_sharedfuncptr.h>
 #include <multipy/runtime/interpreter/plugin_registry.h>
+#include <multipy/runtime/Exception.h>
 #include <pybind11/embed.h>
 #include <pybind11/functional.h>
 #include <pybind11/stl.h>
@@ -239,6 +240,124 @@ bool file_exists(const std::string& path) {
   return (stat(path.c_str(), &buf) == 0);
 }
 
+struct __attribute__((visibility("hidden"))) ConcreteInterpreterObj
+    : public torch::deploy::InterpreterObj {
+
+  ConcreteInterpreterObj(py::handle pyObject)
+      : pyObject_(pyObject) {}
+  ConcreteInterpreterObj(Obj obj){
+    ConcreteInterpreterObj* iObj = (ConcreteInterpreterObj*) (obj.getBaseObj());
+    pyObject_ = iObj->pyObject_;
+  }
+  ConcreteInterpreterObj()
+      : pyObject_(nullptr) {}
+  ConcreteInterpreterObj(const ConcreteInterpreterObj& obj) = default;
+  ConcreteInterpreterObj(ConcreteInterpreterObj&& obj) = default;
+  ConcreteInterpreterObj(ConcreteInterpreterObj& obj) = default;
+
+  py::handle getPyObject() const {
+    MULTIPY_CHECK(pyObject_, "pyObject has already been freed");
+    const py::handle h = pyObject_;
+    return h;
+  }
+
+  at::IValue toIValue() const override {
+    MULTIPY_SAFE_RETHROW {
+    py::handle pyObj = getPyObject();
+    return multipy::toTypeInferredIValue(pyObj);
+    };
+  }
+
+  py::object call(py::handle args, py::handle kwargs = nullptr) {
+    MULTIPY_SAFE_RETHROW {
+    PyObject* result = PyObject_Call(getPyObject().ptr(), args.ptr(), kwargs.ptr());
+    if (!result) {
+      throw py::error_already_set();
+    }
+    return py::reinterpret_steal<py::object>(result);
+    };
+  }
+
+  torch::deploy::Obj call(at::ArrayRef<Obj> args) override {
+    MULTIPY_SAFE_RETHROW {
+    py::tuple m_args(args.size());
+    for (size_t i = 0, N = args.size(); i != N; ++i) {
+      Obj obj = args[i];
+      InterpreterObj* iObj = obj.getBaseObj();
+      m_args[i] = ((ConcreteInterpreterObj*)iObj)->getPyObject();
+    }
+    py::object pyObj = call(m_args);
+    ConcreteInterpreterObj iObj = ConcreteInterpreterObj(pyObj);
+    return Obj(&iObj);
+    };
+  }
+
+torch::deploy::Obj call(at::ArrayRef<at::IValue> args) override {
+      // MULTIPY_SAFE_RETHROW {
+      py::tuple m_args(args.size());
+      for (size_t i = 0, N = args.size(); i != N; ++i) {
+        m_args[i] = multipy::toPyObject(args[i]);
+      }
+      py::object pyObj = call(m_args);
+      ConcreteInterpreterObj iObj = ConcreteInterpreterObj(pyObj);
+      return Obj(&iObj);
+      // };
+  }
+
+torch::deploy::Obj callKwargs(
+      std::vector<at::IValue> args,
+      std::unordered_map<std::string, c10::IValue> kwargs) override {
+
+    MULTIPY_SAFE_RETHROW {
+    py::tuple py_args(args.size());
+    for (size_t i = 0, N = args.size(); i != N; ++i) {
+      py_args[i] = multipy::toPyObject(args[i]);
+    }
+
+    py::dict py_kwargs;
+    for (auto kv : kwargs) {
+      py_kwargs[py::cast(std::get<0>(kv))] =
+          multipy::toPyObject(std::get<1>(kv));
+    }
+    py::object pyObj = call(py_args, py_kwargs);
+    ConcreteInterpreterObj iObj = ConcreteInterpreterObj(pyObj);
+    return Obj(&iObj);
+    };
+  }
+
+torch::deploy::Obj callKwargs(std::unordered_map<std::string, c10::IValue> kwargs) override {
+    return callKwargs({}, kwargs);
+}
+
+bool hasattr(const char* attribute) override {
+  MULTIPY_SAFE_RETHROW {
+  return py::hasattr(getPyObject(), attribute);
+  };
+}
+
+torch::deploy::Obj attr(const char* attribute) override {
+  MULTIPY_SAFE_RETHROW {
+  bool a = hasattr(attribute);
+  py::object pyObj = getPyObject().attr(attribute);
+  ConcreteInterpreterObj iObj = ConcreteInterpreterObj(pyObj);
+  return Obj(&iObj);
+  };
+}
+
+void unload() {
+  MULTIPY_SAFE_RETHROW {
+  MULTIPY_CHECK(pyObject_, "pyObject has already been freed");
+  // free(pyObject_);
+  pyObject_ = nullptr;
+  };
+}
+
+// ~ConcreteInterpreterObj(){
+//   unload();
+// }
+  py::handle pyObject_;
+};
+
 extern "C" __attribute__((visibility("default"))) void
 ConcreteInterpreterImplConstructorCommon(
     const std::vector<std::string>& extra_python_paths,
@@ -361,183 +480,152 @@ struct __attribute__((visibility("hidden"))) ConcreteInterpreterSessionImpl
     : public torch::deploy::InterpreterSessionImpl {
   ConcreteInterpreterSessionImpl(ConcreteInterpreterImpl* interp)
       : interp_(interp) {}
-  Obj global(const char* module, const char* name) override {
-    MULTIPY_SAFE_RETHROW {
-      return wrap(global_impl(module, name));
-    };
+
+  Obj createObj(py::handle h){
+    ConcreteInterpreterObj concreteObj = ConcreteInterpreterObj(h);
+    Obj obj = Obj(&concreteObj);
+    createdObjs_.insert(h.ptr());
+    return obj;
   }
 
-  Obj fromIValue(IValue value) override {
-    MULTIPY_SAFE_RETHROW {
-      return wrap(multipy::toPyObject(value));
-    };
+  Obj createObj(py::object pyObj){
+    py::handle h = pyObj;
+    return createObj(h);
+  }
+  Obj global(const char* module, const char* name) override {
+    py::object globalObj = global_impl(module, name);
+    return createObj(globalObj);
+  }
+
+  Obj fromIValue(at::IValue value) override {
+    py::object pyObj = multipy::toPyObject(value);
+    return createObj(pyObj);
   }
   Obj createOrGetPackageImporterFromContainerFile(
       const std::shared_ptr<caffe2::serialize::PyTorchStreamReader>&
           containerFile_) override {
     MULTIPY_SAFE_RETHROW {
-      InitLockAcquire guard(interp_->init_lock_);
-      py::object pet =
-          (py::object)py::module_::import("torch._C").attr("PyTorchFileReader");
-      return wrap(interp_->getPackage(containerFile_));
+    InitLockAcquire guard(interp_->init_lock_);
+    py::object pet =
+        (py::object)py::module_::import("torch._C").attr("PyTorchFileReader");
+    py::object pyObj =  interp_->getPackage(containerFile_);
+    return createObj(pyObj);
     };
   }
-
+  // optoin 1) for this we stil have to enforce a hashtable relationship between objects and py::objects in the interpretersession.
+  // option 2) another option is to embedded saveStorages into objects which are created from this interpreter
+  // we can track if something is which is not too difficult
+  // Regardless we probably have to do an isOwnerCheck :(
   PickledObject pickle(Obj container, Obj obj) override {
     MULTIPY_SAFE_RETHROW {
-      py::tuple result = interp_->saveStorage(unwrap(container), unwrap(obj));
-      py::bytes bytes = py::cast<py::bytes>(result[0]);
-      py::list storages = py::cast<py::list>(result[1]);
-      py::list dtypes = py::cast<py::list>(result[2]);
-      auto container_file =
-          py::cast<std::shared_ptr<caffe2::serialize::PyTorchStreamReader>>(
-              result[3]);
+    ConcreteInterpreterObj* containerIObj = (ConcreteInterpreterObj*) (container.getBaseObj());
+    ConcreteInterpreterObj* iObj = (ConcreteInterpreterObj*) obj.getBaseObj();
+    py::handle containerPyObject = containerIObj->getPyObject();
+    py::handle objPyObject = iObj->getPyObject();
+    py::tuple result = interp_->saveStorage(containerPyObject, objPyObject);
+    py::bytes bytes = py::cast<py::bytes>(result[0]);
+    py::list storages = py::cast<py::list>(result[1]);
+    py::list dtypes = py::cast<py::list>(result[2]);
+    auto container_file =
+        py::cast<std::shared_ptr<caffe2::serialize::PyTorchStreamReader>>(
+            result[3]);
 
-      std::vector<at::Storage> storages_c;
-      std::vector<at::ScalarType> dtypes_c;
+    std::vector<at::Storage> storages_c;
+    std::vector<at::ScalarType> dtypes_c;
 
-      for (size_t i = 0, N = storages.size(); i < N; ++i) {
-        storages_c.push_back(multipy::createStorage(storages[i].ptr()));
-        dtypes_c.push_back(
-            reinterpret_cast<THPDtype*>(dtypes[i].ptr())->scalar_type);
-      }
-      return PickledObject{
-          bytes,
-          std::move(storages_c),
-          std::move(dtypes_c),
-          std::move(container_file)};
+    for (size_t i = 0, N = storages.size(); i < N; ++i) {
+      storages_c.push_back(multipy::createStorage(storages[i].ptr()));
+      dtypes_c.push_back(
+          reinterpret_cast<THPDtype*>(dtypes[i].ptr())->scalar_type);
+    }
+    return PickledObject{
+        bytes,
+        std::move(storages_c),
+        std::move(dtypes_c),
+        std::move(container_file)};
     };
   }
   Obj unpickleOrGet(int64_t id, const PickledObject& obj) override {
-    MULTIPY_SAFE_RETHROW {
-      py::dict objects = interp_->objects;
-      py::object id_p = py::cast(id);
-      if (objects.contains(id_p)) {
-        return wrap(objects[id_p]);
-      }
+    MULTIPY_SAFE_RETHROW{
+    if (unpickled_objects.find(id) != unpickled_objects.end()){
+      return createObj(unpickled_objects[id]);
+    }
 
-      InitLockAcquire guard(interp_->init_lock_);
-      // re-check if something else loaded this before we acquired the
-      // init_lock_
-      if (objects.contains(id_p)) {
-        return wrap(objects[id_p]);
-      }
+    InitLockAcquire guard(interp_->init_lock_);
+    // re-check if something else loaded this before we acquired the
+    // init_lock_
+    if (unpickled_objects.find(id) != unpickled_objects.end()){
+      return createObj(unpickled_objects[id]);
+    }
 
-      py::tuple storages(obj.storages_.size());
-      for (size_t i = 0, N = obj.storages_.size(); i < N; ++i) {
-        py::object new_storage = py::reinterpret_steal<py::object>(
-            multipy::createPyObject(obj.storages_[i]));
-        storages[i] = std::move(new_storage);
-      }
-      py::tuple dtypes(obj.types_.size());
-      for (size_t i = 0, N = obj.types_.size(); i < N; ++i) {
-        auto dtype = (PyObject*)multipy::getTHPDtype(obj.types_[i]);
-        Py_INCREF(dtype);
-        dtypes[i] = dtype;
-      }
-      py::object result = interp_->loadStorage(
-          id, obj.containerFile_, py::bytes(obj.data_), storages, dtypes);
-      return wrap(result);
+    py::tuple storages(obj.storages_.size());
+    for (size_t i = 0, N = obj.storages_.size(); i < N; ++i) {
+      py::object new_storage = py::reinterpret_steal<py::object>(
+          multipy::createPyObject(obj.storages_[i]));
+      storages[i] = std::move(new_storage);
+    }
+    py::tuple dtypes(obj.types_.size());
+    for (size_t i = 0, N = obj.types_.size(); i < N; ++i) {
+      auto dtype = (PyObject*)multipy::getTHPDtype(obj.types_[i]);
+      Py_INCREF(dtype);
+      dtypes[i] = dtype;
+    }
+    py::object result = interp_->loadStorage(
+        id, obj.containerFile_, py::bytes(obj.data_), storages, dtypes);
+    unpickled_objects[id] = result;
+    return createObj(result);
     };
   }
   void unload(int64_t id) override {
-    MULTIPY_SAFE_RETHROW {
-      py::dict objects = interp_->objects;
-      py::object id_p = py::cast(id);
-      if (objects.contains(id_p)) {
-        objects.attr("__delitem__")(id_p);
-      }
-    };
+    ConcreteInterpreterObj obj = unpickled_objects[id];
+    obj.unload();
   }
 
-  IValue toIValue(Obj obj) const override {
-    MULTIPY_SAFE_RETHROW {
-      return multipy::toTypeInferredIValue(unwrap(obj));
-    };
+  at::IValue toIValue(Obj obj) const override {
+    return obj.toIValue();
   }
 
   Obj call(Obj obj, at::ArrayRef<Obj> args) override {
-    MULTIPY_SAFE_RETHROW {
-      py::tuple m_args(args.size());
-      for (size_t i = 0, N = args.size(); i != N; ++i) {
-        m_args[i] = unwrap(args[i]);
-      }
-      return wrap(call(unwrap(obj), m_args));
-    };
+    return obj(args);
   }
 
-  Obj call(Obj obj, at::ArrayRef<IValue> args) override {
-    MULTIPY_SAFE_RETHROW {
-      py::tuple m_args(args.size());
-      for (size_t i = 0, N = args.size(); i != N; ++i) {
-        m_args[i] = multipy::toPyObject(args[i]);
-      }
-      return wrap(call(unwrap(obj), m_args));
-    };
+  Obj call(Obj obj, at::ArrayRef<at::IValue> args) override {
+    return obj(args);
   }
 
   Obj callKwargs(
       Obj obj,
       std::vector<at::IValue> args,
       std::unordered_map<std::string, c10::IValue> kwargs) override {
-    MULTIPY_SAFE_RETHROW {
-      py::tuple py_args(args.size());
-      for (size_t i = 0, N = args.size(); i != N; ++i) {
-        py_args[i] = multipy::toPyObject(args[i]);
-      }
-
-      py::dict py_kwargs;
-      for (auto kv : kwargs) {
-        py_kwargs[py::cast(std::get<0>(kv))] =
-            multipy::toPyObject(std::get<1>(kv));
-      }
-      return wrap(call(unwrap(obj), py_args, py_kwargs));
-    };
+    return obj.callKwargs(args, kwargs);
   }
 
   Obj callKwargs(Obj obj, std::unordered_map<std::string, c10::IValue> kwargs)
       override {
-    return callKwargs(obj, {}, kwargs);
+    return obj.callKwargs(kwargs);
   }
 
   bool hasattr(Obj obj, const char* attr) override {
-    MULTIPY_SAFE_RETHROW {
-      return py::hasattr(unwrap(obj), attr);
-    };
+    return obj.hasattr(attr);
   }
 
   Obj attr(Obj obj, const char* attr) override {
-    MULTIPY_SAFE_RETHROW {
-      return wrap(unwrap(obj).attr(attr));
-    };
+    return obj.attr(attr);
   }
 
-  static py::object
-  call(py::handle object, py::handle args, py::handle kwargs = nullptr) {
-    MULTIPY_SAFE_RETHROW {
-      PyObject* result = PyObject_Call(object.ptr(), args.ptr(), kwargs.ptr());
-      if (!result) {
-        throw py::error_already_set();
-      }
-      return py::reinterpret_steal<py::object>(result);
-    };
+  bool isOwner(Obj obj){
+    ConcreteInterpreterObj* iObj = (ConcreteInterpreterObj*) obj.getBaseObj();
+    py::handle pyObj = iObj->getPyObject();
+    return createdObjs_.find(pyObj.ptr()) != createdObjs_.end();
   }
 
-  py::handle unwrap(Obj obj) const {
-    return objects_.at(ID(obj));
-  }
-
-  Obj wrap(py::object obj) {
-    objects_.emplace_back(std::move(obj));
-    return Obj(this, objects_.size() - 1);
-  }
-
-  ~ConcreteInterpreterSessionImpl() override {
-    objects_.clear();
-  }
+  // ~ConcreteInterpreterSessionImpl() override {
+  //   objects_.clear();
+  // }
   ConcreteInterpreterImpl* interp_;
   ScopedAcquire acquire_;
-  std::vector<py::object> objects_;
+  std::unordered_map<int64_t, py::handle> unpickled_objects;
+  std::unordered_set<PyObject*> createdObjs_;
 };
 
 torch::deploy::InterpreterSessionImpl*
