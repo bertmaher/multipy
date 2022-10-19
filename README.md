@@ -5,13 +5,12 @@
 
 > :warning: **This is project is still a prototype.** Only Linux x86 is supported, and the API may change without warning. Furthermore, please **USE PYTORCH NIGHTLY** when using `multipy::runtime`!
 
-`MultiPy` (formerly `torch::deploy` and `torch.package`) is a system that allows you to run multi-threaded python code in C++. It offers `multipy.package` (formerly `torch.package`) in order to package code into a mostly hermetic format to deliver to `multipy::runtime` (formerly `torch::deploy`) which is a runtime which takes packaged
-code and runs it using multiple embedded Python interpreters in a C++ process without a shared global interpreter lock (GIL). For more information on how `MultiPy` works
-internally, please see the related [arXiv paper](https://arxiv.org/pdf/2104.00254.pdf).
+`MultiPy` is a system that allows you to run multi-threaded python code in C++. Currently, multipy offers `torch::deploy` which works in conjuction with [`torch.package`](https://pytorch.org/docs/stable/package.html) in order to run pytorch models using multiple embedded Python interpreters in a single C++ process.  For more information on how `torch::deploy` works
+internally, please see the related [arXiv paper](https://arxiv.org/pdf/2104.00254.pdf). As next steps, we plan to generalize `torch::deploy` into `multipy::runtime` which allows one to utilize multiple embedded Python interpreters with arbitrary Python code rather than being specificially tailored to PyTorch models.
 
 ## Installation
 
-### Building `multipy::runtime` via Docker
+### Building `torch::deploy` via Docker
 
 The easiest way to build multipy, along with fetching all interpreter dependencies, is to do so via docker.
 
@@ -49,16 +48,6 @@ The runtime system dependencies are specified in `build-requirements.txt`. To in
 ```shell
 sudo apt update
 xargs sudo apt install -y -qq --no-install-recommends <build-requirements.txt
-```
-
-We recommend using the latest version of `cmake` and compilers available for your system. On Ubuntu 18.04, for example, these can be updated as follows:
-
-```shell
-wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | sudo gpg --dearmor -o /usr/share/keyrings/magic-key.gpg
-echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/magic-key.gpg] https://apt.kitware.com/ubuntu/ bionic main" | sudo tee -a /etc/apt/sources.list
-echo "deb http://security.ubuntu.com/ubuntu focal-security main" | sudo tee -a /etc/apt/sources.list
-sudo apt update
-sudo apt install -y binutils cmake
 ```
 
 #### Installing environment encapsulators
@@ -136,7 +125,7 @@ pip install  -e . --install-option="--cmakeoff"
 > **NOTE** As of 10/11/2022 the linking of prebuilt static fPIC versions of python downloaded from `conda-forge` can be problematic on certain systems (for example Centos 8), with linker errors like `libpython_multipy.a: error adding symbols: File format not recognized`. This seems to be an issue with `binutils`, and the steps in https://wiki.gentoo.org/wiki/Project:Toolchain/Binutils_2.32_upgrade_notes/elfutils_0.175:_unable_to_initialize_decompress_status_for_section_.debug_info can help. Alternatively, the user can go with the `virtualenv`/`pyenv` flow above.
 
 
-### Running `multipy::runtime` build steps from source
+### Running `torch::deploy` build steps from source
 
 Both `docker` and `pip install` options above are wrappers around the `cmake build` of multipy's runtime. If the user wishes to run the build steps manually instead, as before the dependencies would have to be installed in the user's (isolated) environment of choice first. After that the following steps can be executed:
 
@@ -161,9 +150,9 @@ cmake ..
 cmake --build . --config Release
 ```
 
-### Running unit tests for `multipy::runtime`
+### Running unit tests for `torch::deploy`
 
-We first need to generate the neccessary examples. First make sure your python enviroment has [torch](https://pytorch.org). Afterwards, once `multipy::runtime` is built, run the following (executed automatically for `docker` and `pip` above):
+We first need to generate the neccessary examples. First make sure your python enviroment has [torch](https://pytorch.org). Afterwards, once `torch::deploy` is built, run the following (executed automatically for `docker` and `pip` above):
 
 ```
 cd multipy/multipy/runtime
@@ -172,16 +161,16 @@ cd build
 ./test_deploy
 ```
 
-## Examples
+## Quickstart
 
 See the [examples directory](./examples) for complete examples.
 
-### Packaging a model `for multipy::runtime`
+### Packaging a model `for torch::deploy`
 
-``multipy::runtime`` can load and run Python models that are packaged with
+``torch::deploy`` can load and run Python models that are packaged with
 ``torch.package``. You can learn more about ``torch.package`` in the ``torch.package`` [documentation](https://pytorch.org/docs/stable/package.html#tutorials).
 
-For now, let's create a simple model that we can load and run in ``multipy::runtime``.
+For now, let's create a simple model that we can load and run in ``torch::deploy``.
 
 ```python
 from torch.package import PackageExporter
@@ -225,16 +214,16 @@ int main(int argc, const char* argv[]) {
     }
 
     // Start an interpreter manager governing 4 embedded interpreters.
-    std::shared_ptr<multipy::runtime::Environment> env =
-        std::make_shared<multipy::runtime::PathEnvironment>(
+    std::shared_ptr<torch::deploy::Environment> env =
+        std::make_shared<torch::deploy::PathEnvironment>(
             std::getenv("PATH_TO_EXTERN_PYTHON_PACKAGES") // Ensure to set this environment variable (e.g. /home/user/anaconda3/envs/multipy-example/lib/python3.8/site-packages)
         );
-    multipy::runtime::InterpreterManager manager(4, env);
+    torch::deploy::InterpreterManager manager(4, env);
 
     try {
-        // Load the model from the multipy.package.
-        multipy::runtime::Package package = manager.loadPackage(argv[1]);
-        multipy::runtime::ReplicatedObj model = package.loadPickle("model", "model.pkl");
+        // Load the model from the torch.package.
+        torch::deploy::Package package = manager.loadPackage(argv[1]);
+        torch::deploy::ReplicatedObj model = package.loadPickle("model", "model.pkl");
     } catch (const c10::Error& e) {
         std::cerr << "error loading the model\n";
         std::cerr << e.msg();
@@ -246,7 +235,7 @@ int main(int argc, const char* argv[]) {
 
 ```
 
-This small program introduces many of the core concepts of ``multipy::runtime``.
+This small program introduces many of the core concepts of ``torch::deploy``.
 
 An ``InterpreterManager`` abstracts over a collection of independent Python
 interpreters, allowing you to load balance across them when running your code.
@@ -255,7 +244,7 @@ interpreters, allowing you to load balance across them when running your code.
 packages on your system which are external, but necessary, for your model.
 
 Using the ``InterpreterManager::loadPackage`` method, you can load a
-``multipy.package`` from disk and make it available to all interpreters.
+``torch.package`` from disk and make it available to all interpreters.
 
 ``Package::loadPickle`` allows you to retrieve specific Python objects
 from the package, like the ResNet model we saved earlier.
@@ -273,7 +262,7 @@ Assuming the above C++ program was stored in a file called, `example-app.cpp`, a
 minimal `CMakeLists.txt` file would look like:
 
 ```cmake
-cmake_minimum_required(VERSION 3.19 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.12 FATAL_ERROR)
 project(multipy_tutorial)
 
 set(MULTIPY_PATH ".." CACHE PATH "The repo where multipy is built or the PYTHONPATH")
@@ -299,7 +288,7 @@ add_executable(example-app example-app.cpp)
 target_link_libraries(example-app PUBLIC "-Wl,--no-as-needed -rdynamic" dl pthread util multipy c10 torch_cpu)
 ```
 
-Currently, it is necessary to build ``multipy::runtime`` as a static library.
+Currently, it is necessary to build ``torch::deploy`` as a static library.
 In order to correctly link to a static library, the utility ``caffe2_interface_library``
 is used to appropriately set and unset ``--whole-archive`` flag.
 
